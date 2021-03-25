@@ -1,3 +1,71 @@
+"""Usage:
+
+This script should be placed with runexp.py.
+I recommend to copy two files (this and runexp.py) in each directory where experiments are done.
+
+### Usage 1: Low-level management of QusbWorkflow
+
+# First, define the template qsub file for your experiment.
+# In this template, __XXX__ is a placeholder, which will be filled by variable `xxx` given to `new_env` argument later.
+template = '''#!/bin/bash
+
+#$-l __MACHINE__=1
+#$-l h_rt=__TIME__
+#$-j y
+#$-cwd
+# you can add more preambles here.
+
+source /etc/profile.d/modules.sh
+source __VENV__/bin/activate  # __VENV__ is filled by some value if `venv` argument is given (see below).
+# conda activate __CONDA__  # In this case, variable `conda` will replace __CONDA__.
+
+cd __DIR__  # __DIR__ is automatically replaced with the current directory.
+
+__CMD__
+'''
+
+# When dry_run=True, the command will not be executed (similar to dry_run in make).
+with QsubWorkflow(template=template, qsub_dir='qsubs', dry_run=True) as workflow:
+    with workflow.new_env(time='5:00', venv='/path/venv', delete_qsub=False) as env:
+        env.add_task('echo a > a.txt', tgt='a.txt')  # this will regist new qsub script (which will be created in `qsub_dir` directory, and deleted if `delete_qsub` is True).
+        env.add_task('echo b > b.txt', tgt='b.txt')
+    with workflow.new_env(time='3:00', venv='/path/venv') as env:
+        env.add_task('echo c > c.txt', tgt='c.txt')
+    workflow.run()  # wrap exp.run()
+
+
+### Usage 2: using run_qsub to avoid managing QusbWorkflow by yourself.
+
+template = '''#!/bin/bash
+
+#$-l __MACHINE__=1
+#$-l h_rt=__TIME__
+#$-j y
+#$-cwd
+# you can add more preambles here.
+
+source /etc/profile.d/modules.sh
+source __VENV__/bin/activate  # __VENV__ is filled by some value if `venv` argument is given (see below).
+# conda activate __CONDA__  # In this case, variable `conda` will replace __CONDA__.
+
+cd __DIR__  # __DIR__ is automatically replaced with the current directory.
+
+__CMD__
+'''
+
+def add_task_fn_gen(chars):
+    def add_task(env):
+       for x in chars:
+           cmd = 'echo {} > {}.txt'.format(x, x)
+           env.add_task(cmd, tgt='{}.txt'.format(x))
+    return add_task
+
+add_task_fns = [add_task_fn_gen(['a', 'b', 'c'])]  # A list of functions to add a task to `env`.
+
+run_qsub(add_task_fns, template, venv='/path/venv')
+
+"""
+
 from hashlib import md5
 import logging
 import numpy as np
@@ -14,45 +82,62 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-"""Usage:
-
-with runexp.py
-
-# add jobs under some common configuration
-
-template = '''#!/bin/bash
-
-#$-l __MACHINE__=1
-#$-l h_rt=__TIME__
-#$-j y
-#$-cwd
-
-source /etc/profile.d/modules.sh
-source __VENV__/bin/activate  # __XXX__ is a placeholder, which can be filled by variable `xxx` given to `new_env` argument.
-# conda activate __CONDA__  # In this case, variable `conda` will replace __CONDA__.
-
-cd __DIR__
-
-__CMD__
-'''
-
-with QsubWorkflow(template=template) as workflow:
-    with workflow.new_env(time='5:00', venv='/path/venv') as env:
-        env.add_task('cmd1')  # this will regist new qsub script (might be deleted later)
-        env.add_task('cmd2')
-    with workflow.new_env(time='3:00', venv='/path/venv') as env:
-        env.add_task('cmd3')
-    workflow.run()  # wrap exp.run()
-"""
-
 def run_qsub(add_task_fns, template, dry_run=False, num_jobs=128, time='5:00:00', group='gac50547',
-             sync=True, machine='rt_G.small', keep_going=True, **env_args):
+             sync=True, machine='rt_G.small', keep_going=True, delete_qsub=False,
+             qsub_dir='qsub', **env_args):
+    """A wrapper of QusbWorkflow, which regists all tasks created by functions in `add_task_fns`.
+
+    Parameters
+    ----------
+    add_task_fns : list
+        A list of functions, each of which receives `env` variable and call `add_task`
+        (regist a new task). `env` is an instance of `QsubEnv` and `add_task` has
+        three arguments:
+            `add_task(self, cmd, src=None, tgt=None).`
+        `cmd` is a shell command to be executed (e.g., train or evaluate a model).
+        `src` and `tgt` is source and target files, which define the order of execusion
+        of tasks. The order is determined so that all `src`s in any task should be
+        created before execusion (i.e., in typological order of a graph defined by source
+        and targets). `src` and `tgt` can be a str, or a list of str, if multiple files
+        are source or target.
+    template : str
+        A template qsub file. __XXX__ is a placeholder that can be filled by custom variables
+        (see also **env_args).
+    dry_run : bool
+        If True, do not run the command and just simulate the execusion.
+    num_jobs : int
+        Number of parallel qsub jobs.
+    time : str
+        The time in the format of qsub.
+    group : str
+        Your ABCI group.
+    sync : bool
+        If False, the tasks are executed asynchronously, and just finish after calling all
+        qsub tasks. This should be `True` when there is a dependence between different tasks
+        (by src and tgt). Setting this to `False` is useful when you want to avoid to remain
+        the process (of this function) due to some reason, e.g., to avoid to occupy a process
+        in Jupyter.
+    machine : str
+        The machine name of ABCI.
+    keep_going : bool
+        If False, all qsub commands are killed when there is an error in some command.
+    delete_qsub : bool
+        Before calling a qusb command, all qsub script will be stored in `qsub_dir` directory.
+        These files are deleted when this is True.
+    qsub_dir : str
+        The directory in which all qsub files are stored.
+    **env_args
+        Additional arguments to be used to fill placeholders in `template`. For example,
+        when the template contains the following line:
+           `conda activate __CONDA__`,
+        by run_qsub(..., conda='torch-1.7'), this __CONDA__ will be filled by `torch-1.7`.
+    """
     if not isinstance(add_task_fns, list):
         add_task_fns = [add_task_fns]
     with QsubWorkflow(template=template, dry_run=dry_run, num_jobs=num_jobs, keep_going=keep_going,
-                      qsub_dir='qsubs') as workflow:
-        with workflow.new_env(machine=machine, time=time, delete_qsub=False,
-                              sync=sync, conda=conda, group=group, **env_args) as env:
+                      qsub_dir=qsub_dir) as workflow:
+        with workflow.new_env(machine=machine, time=time, delete_qsub=delete_qsub,
+                              sync=sync, group=group, **env_args) as env:
             for add_task_fn in add_task_fns:
                 add_task_fn(env)
             workflow.run()
@@ -315,3 +400,33 @@ if __name__ == '__main__':
             env.add_task('ls > ls3.txt', tgt='ls3.txt')
 
         workflow.run()
+
+
+    template = '''#!/bin/bash
+
+#$-l __MACHINE__=1
+#$-l h_rt=__TIME__
+#$-j y
+#$-cwd
+# you can add more preambles here.
+
+source /etc/profile.d/modules.sh
+source ~/load_cuda_moduels.sh
+. /home/aaa10317sm/anaconda3/etc/profile.d/conda.sh
+conda activate __CONDA__
+
+cd __DIR__
+
+__CMD__
+'''
+    def add_task_fn_gen(chars):
+        def add_task(env):
+            for x in chars:
+                cmd = 'echo {} > {}.txt'.format(x, x)
+                env.add_task(cmd, tgt='{}.txt'.format(x))
+        return add_task
+
+    add_task_fns = [add_task_fn_gen(['a', 'b', 'c'])]  # A list of functions to add a task to `env`.
+
+    run_qsub(add_task_fns, template, dry_run=False, conda='torch-1.7')
+
